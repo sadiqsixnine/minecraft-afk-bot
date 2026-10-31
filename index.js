@@ -222,6 +222,11 @@ app.get('/', (req, res) => {
                 <dd>${config.server.ip}</dd>
                 <p class="stat-detail">Minecraft server hostname</p>
               </div>
+              <div class="stat-card">
+                <dt>Keep-alive</dt>
+                <dd id="keepalive-text">—</dd>
+                <p class="stat-detail">Self-ping that stops Render from sleeping</p>
+              </div>
             </dl>
           </section>
 
@@ -233,6 +238,9 @@ app.get('/', (req, res) => {
             <div class="btn-grid btn-grid-2">
               <a href="/tutorial" class="btn-secondary" aria-label="View setup guide">Setup guide</a>
               <a href="/logs" class="btn-secondary" aria-label="View bot logs">View logs</a>
+            </div>
+            <div class="btn-grid">
+              <a href="/diag" class="btn-secondary" aria-label="View diagnostics">Diagnostics</a>
             </div>
           </section>
 
@@ -279,6 +287,26 @@ app.get('/', (req, res) => {
                 document.getElementById('coords-text').textContent = 'X ' + x + ', Y ' + y + ', Z ' + z;
               } else {
                 document.getElementById('coords-text').textContent = 'Searching…';
+              }
+
+              const ka = data.keepAlive || {};
+              const kaEl = document.getElementById('keepalive-text');
+              if (kaEl) {
+                if (!ka.enabled) {
+                  kaEl.textContent = 'Off';
+                  kaEl.style.color = '#e3b341';
+                } else if (ka.consecutiveFailures > 0) {
+                  kaEl.textContent = 'Failing (' + ka.consecutiveFailures + ')';
+                  kaEl.style.color = '#f85149';
+                } else if (ka.lastPingAt) {
+                  const ago = Math.round((Date.now() - ka.lastPingAt) / 1000);
+                  kaEl.textContent = 'OK' + (ka.lastStatus ? ' (' + ka.lastStatus + ')' : '') +
+                                     ' · ' + (ago < 90 ? ago + 's ago' : Math.round(ago / 60) + 'm ago');
+                  kaEl.style.color = '#3fb950';
+                } else {
+                  kaEl.textContent = 'Warming up…';
+                  kaEl.style.color = '#8b949e';
+                }
               }
             } catch (e) {
               const label = document.getElementById('status-label');
@@ -356,6 +384,7 @@ app.get("/tutorial", (req, res) => {
 });
 
 app.get("/health", (req, res) => {
+  const ka = keepAlive.stats();
   res.json({
     status: botState.connected ? "connected" : "disconnected",
     uptime: Math.floor((Date.now() - botState.startTime) / 1000),
@@ -363,6 +392,14 @@ app.get("/health", (req, res) => {
     lastActivity: botState.lastActivity,
     reconnectAttempts: botState.reconnectAttempts,
     memoryUsage: process.memoryUsage().heapUsed / 1024 / 1024,
+    keepAlive: {
+      enabled: ka.enabled,
+      lastStatus: ka.lastStatus,
+      lastPingAt: ka.lastPingAt,
+      nextPingInSec: ka.nextPingInSec,
+      consecutiveFailures: ka.consecutiveFailures,
+      disabledReason: ka.disabledReason,
+    },
   });
 });
 
