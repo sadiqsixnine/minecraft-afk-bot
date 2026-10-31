@@ -1,0 +1,48 @@
+## Render Blueprint — deploy this repo as ONE free Web Service.
+##
+## Notes that matter for this bot:
+##   * "type: web" is required. Free *Background Workers* do not exist on Render,
+##     and a worker has no public URL, so the keep-alive self-ping cannot work.
+##   * plan: free → 750 instance hours / month per workspace. Running the bot
+##     24/7 uses ~720–744 of them, so do not run a second free service on the
+##     same workspace if you want this one to survive the whole month.
+##   * healthCheckPath keeps Render's own health probe cheap and real.
+services:
+  - type: web
+    name: minecraft-afk-bot
+    runtime: node
+    plan: free
+    region: singapore # pick the region closest to your Minecraft server
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: 22.11.0
+      - key: NODE_ENV
+        value: production
+      # 512 MB free instance → keep V8's heap below that so the process exits
+      # with our guard instead of being OOM-killed by the platform.
+      - key: NODE_OPTIONS
+        value: --max-old-space-size=384
+      - key: MEMORY_LIMIT_MB
+        value: "460"
+      # Self-ping every 5 min (< Render's 15 min idle limit). Set to "0" to disable.
+      - key: KEEP_ALIVE
+        value: "1"
+      - key: KEEP_ALIVE_INTERVAL_MS
+        value: "300000"
+      # ---- Optional overrides (settings.json is used when these are unset) ----
+      # - key: MC_HOST
+      #   value: thelegions.aternos.me
+      # - key: MC_PORT
+      #   value: "62129"
+      # - key: MC_VERSION
+      #   value: 1.20.1
+      # - key: MC_USERNAME
+      #   value: FREDDYGOAT
+      # - key: MC_AUTH
+      #   value: offline
+      # - key: AUTH_PASSWORD
+      #   sync: false

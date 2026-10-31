@@ -5,9 +5,45 @@ const mineflayer = require("mineflayer");
 const { Movements, pathfinder, goals } = require("mineflayer-pathfinder");
 const { GoalBlock } = goals;
 const config = require("./settings.json");
+const pkg = require("./package.json");
+const { createKeepAlive } = require("./keepalive");
 const express = require("express");
 const http = require("http");
 const https = require("https");
+
+// ============================================================
+// ENV OVERRIDES
+// Render env vars win over settings.json, so you can change the
+// target server / account from the dashboard without redeploying code.
+// ============================================================
+function applyEnvOverrides(cfg) {
+  const env = process.env;
+  const num = (v) => {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  };
+
+  cfg.server = cfg.server || {};
+  cfg["bot-account"] = cfg["bot-account"] || {};
+  cfg.utils = cfg.utils || {};
+
+  if (env.MC_HOST) cfg.server.ip = env.MC_HOST;
+  const port = num(env.MC_PORT);
+  if (port) cfg.server.port = port;
+  if (env.MC_VERSION) cfg.server.version = env.MC_VERSION;
+  if (env.MC_USERNAME) cfg["bot-account"].username = env.MC_USERNAME;
+  if (env.MC_AUTH) cfg["bot-account"].type = env.MC_AUTH;
+  if (env.MC_PASSWORD) cfg["bot-account"].password = env.MC_PASSWORD;
+
+  if (env.AUTH_PASSWORD) {
+    cfg.utils["auto-auth"] = cfg.utils["auto-auth"] || { enabled: true };
+    cfg.utils["auto-auth"].password = env.AUTH_PASSWORD;
+  }
+
+  return cfg;
+}
+
+applyEnvOverrides(config);
 
 // ============================================================
 // EXPRESS SERVER - Keep Render/Aternos alive
@@ -15,6 +51,14 @@ const https = require("https");
 const app = express();
 app.use(express.json());
 const PORT = process.env.PORT || 5000;
+
+// Keep-alive (self-ping) — prevents Render's 15 minute free-tier idle spin-down.
+// Started after the HTTP server is listening; inspected by GET /diag.
+const keepAlive = createKeepAlive({ log: addLog });
+
+// Render free instances have 512 MB RAM. Restart ourselves before the OOM
+// killer does, because a hard OOM looks exactly like "the service died".
+const MEMORY_LIMIT_MB = Number(process.env.MEMORY_LIMIT_MB) || 460;
 
 // Bot state tracking
 let botState = {
@@ -322,6 +366,83 @@ app.get("/health", (req, res) => {
   });
 });
 
+// Full diagnostic dump — the first place to look when Render suspends the
+// service or the bot keeps dropping. Everything here is read-only.
+app.get("/diag", (req, res) => {
+  const mem = process.memoryUsage();
+  const mb = (bytes) => Math.round((bytes / 1024 / 1024) * 10) / 10;
+  const ka = keepAlive.stats();
+
+  const hints = [];
+  if (!process.env.RENDER) {
+    hints.push("Not running on Render (RENDER env var missing) — keep-alive only matters in production.");
+  }
+  if (!process.env.RENDER_EXTERNAL_URL) {
+    hints.push(
+      "RENDER_EXTERNAL_URL is not set. Render only sets it for Web Services — a Background Worker has no public URL and cannot be kept awake this way.",
+    );
+  }
+  if (!ka.enabled) {
+    hints.push(`Self-ping is OFF: ${ka.disabledReason || "unknown reason"}.`);
+  }
+  if (ka.consecutiveFailures > 0) {
+    hints.push(
+      `Self-ping failing (${ka.consecutiveFailures} in a row): ${ka.lastError}. Requests are not reaching the service, so Render's idle timer is not being reset.`,
+    );
+  }
+  if (process.env.RENDER && ka.enabled && ka.consecutiveFailures === 0 && ka.totalPings > 0) {
+    hints.push("Keep-alive is healthy: idle spin-down should not happen while this process runs.");
+  }
+  hints.push(
+    "If the Render dashboard shows 'Suspended' with a Resume button, that is not idle spin-down — check Dashboard > Billing (750 free instance hours/month) and the Events tab.",
+  );
+
+  res.json({
+    ok: true,
+    app: {
+      name: config.name,
+      version: pkg.version,
+      node: process.version,
+      pid: process.pid,
+      uptimeSec: Math.floor((Date.now() - botState.startTime) / 1000),
+      botRunning,
+    },
+    server: {
+      host: config.server.ip,
+      port: config.server.port,
+      version: config.server.version,
+      username: config["bot-account"].username,
+      auth: config["bot-account"].type,
+    },
+    bot: {
+      connected: botState.connected,
+      spawned: Boolean(bot && bot.entity),
+      position: bot && bot.entity ? bot.entity.position : null,
+      reconnectAttempts: botState.reconnectAttempts,
+      reconnecting: isReconnecting,
+      lastActivity: botState.lastActivity,
+      recentErrors: botState.errors.slice(-5),
+    },
+    keepAlive: ka,
+    render: {
+      detected: Boolean(process.env.RENDER),
+      serviceName: process.env.RENDER_SERVICE_NAME || null,
+      serviceId: process.env.RENDER_SERVICE_ID || null,
+      instanceType: process.env.RENDER_INSTANCE_TYPE || null,
+      region: process.env.RENDER_REGION || null,
+      externalUrl: process.env.RENDER_EXTERNAL_URL || null,
+    },
+    memory: {
+      rssMB: mb(mem.rss),
+      heapUsedMB: mb(mem.heapUsed),
+      heapTotalMB: mb(mem.heapTotal),
+      externalMB: mb(mem.external),
+      limitMB: MEMORY_LIMIT_MB,
+    },
+    hints,
+  });
+});
+
 app.get("/ping", (req, res) => res.send("pong"));
 
 app.get("/logs", (req, res) => {
@@ -534,40 +655,48 @@ function formatUptime(seconds) {
 }
 
 // ============================================================
-// SELF-PING - Prevent Render from sleeping
+// KEEP-ALIVE - stop Render's free-tier 15 min idle spin-down
 // ============================================================
-const SELF_PING_INTERVAL = 10 * 60 * 1000;
+// Render puts a free web service to sleep after 15 minutes without inbound
+// HTTP traffic. Minecraft/Discord traffic is outbound, so it does not count.
+// See keepalive.js for the full rules (no localhost, no /robots.txt, retries).
+keepAlive.start();
 
-function startSelfPing() {
-  const renderUrl = process.env.RENDER_EXTERNAL_URL;
-  if (!renderUrl) {
-    addLog("[KeepAlive] No RENDER_EXTERNAL_URL set - self-ping disabled (running locally)");
-    return;
+// ============================================================
+// MEMORY MONITORING - free tier has 512 MB, reboot before OOM
+// ============================================================
+let memoryLogTick = 0;
+
+setInterval(() => {
+  const mem = process.memoryUsage();
+  const rssMB = mem.rss / 1024 / 1024;
+  const heapMB = mem.heapUsed / 1024 / 1024;
+
+  memoryLogTick += 1;
+  if (memoryLogTick % 5 === 1) {
+    addLog(
+      `[Memory] RSS: ${rssMB.toFixed(1)} MB | Heap: ${heapMB.toFixed(1)} MB | Limit: ${MEMORY_LIMIT_MB} MB`,
+    );
   }
-  setInterval(() => {
-    const protocol = renderUrl.startsWith("https") ? https : http;
-    protocol
-      .get(`${renderUrl}/ping`, (res) => {})
-      .on("error", (err) => {
-        addLog(`[KeepAlive] Self-ping failed: ${err.message}`);
-      });
-  }, SELF_PING_INTERVAL);
-  addLog("[KeepAlive] Self-ping system started (every 10 min)");
-}
 
-startSelfPing();
-
-// ============================================================
-// MEMORY MONITORING
-// ============================================================
-setInterval(
-  () => {
-    const mem = process.memoryUsage();
-    const heapMB = (mem.heapUsed / 1024 / 1024).toFixed(2);
-    addLog(`[Memory] Heap: ${heapMB} MB`);
-  },
-  5 * 60 * 1000,
-);
+  if (rssMB > MEMORY_LIMIT_MB) {
+    addLog(
+      `[Memory] RSS ${rssMB.toFixed(1)} MB is above the ${MEMORY_LIMIT_MB} MB guard — restarting the process before Render OOM-kills it`,
+    );
+    if (config.discord && config.discord.enabled) {
+      sendDiscordWebhook(
+        `[!] **Memory guard** — restarting at ${rssMB.toFixed(0)} MB RSS`,
+        0xf59e0b,
+      );
+    }
+    botRunning = false;
+    keepAlive.stop();
+    try {
+      if (bot) bot.quit();
+    } catch (_) {}
+    setTimeout(() => process.exit(1), 2000);
+  }
+}, 60 * 1000);
 
 // ============================================================
 // RECONNECTION & TIMEOUT MANAGEMENT
@@ -659,7 +788,9 @@ function createBot() {
       host: config.server.ip,
       port: config.server.port,
       version: botVersion,
-      hideErrors: false,
+      // Hide raw protocol stack traces in production: they flood Render logs
+      // (free tier log storage is limited) while our own handlers still log.
+      hideErrors: process.env.MC_DEBUG !== "1",
       checkTimeoutInterval: 600000,
     });
 
@@ -1320,6 +1451,7 @@ process.on("unhandledRejection", (reason) => {
 process.on("SIGTERM", () => {
   addLog("[System] SIGTERM received — shutting down gracefully for Render redeploy.");
   botRunning = false;
+  keepAlive.stop();
   if (bot) {
     try { bot.quit(); } catch (_) {}
   }
@@ -1329,6 +1461,7 @@ process.on("SIGTERM", () => {
 process.on("SIGINT", () => {
   addLog("[System] SIGINT received — shutting down.");
   botRunning = false;
+  keepAlive.stop();
   if (bot) {
     try { bot.quit(); } catch (_) {}
   }
@@ -1339,11 +1472,15 @@ process.on("SIGINT", () => {
 // START THE BOT
 // ============================================================
 addLog("=".repeat(50));
-addLog("  Minecraft AFK Bot v2.5 - Render Ready Edition");
+addLog(`  ${config.name} v${pkg.version} - Render Ready Edition`);
 addLog("=".repeat(50));
 addLog(`Server: ${config.server.ip}:${config.server.port}`);
 addLog(`Version: ${config.server.version}`);
+addLog(`Account: ${config["bot-account"].username} (${config["bot-account"].type})`);
 addLog(`Auto-Reconnect: ${config.utils["auto-reconnect"] ? "Enabled" : "Disabled"}`);
+addLog(`KeepAlive: ${process.env.KEEP_ALIVE === "0" ? "Disabled by env" : "Enabled"}`);
+addLog(`Memory guard: ${MEMORY_LIMIT_MB} MB RSS`);
+addLog(`Health: GET /health | Diagnostics: GET /diag`);
 addLog("=".repeat(50));
 
 createBot();
